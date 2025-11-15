@@ -17,45 +17,48 @@
 #include <WebServer.h>
 #include <vector>
 #include <ctime>
+#include <freertos/semphr.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 // ESP32 GPIO pins for HX711
 const int LOADCELL_DOUT_PIN = 18;
 const int LOADCELL_SCK_PIN = 16;
 
-// RGB component.
-const int freq = 5000;    // PWM Frequency (5 kHz)
-const int resolution = 8; // PWM Resolution (8 bits = 0 to 255 brightness levels)
-const int redPin = 22;
-const int greenPin = 21;
-const int bluePin = 19;
+// RGB component
+const int PWM_FREQ = 5000;    // PWM Frequency (5 kHz)
+const int PWM_RESOLUTION = 8; // PWM Resolution (8 bits = 0 to 255 brightness levels)
+const int RED_PIN = 22;
+const int GREEN_PIN = 21;
+const int BLUE_PIN = 19;
 
-// Wifi configuration.
-const char *ssid = "xxx";
-const char *password = "xxx";
+// WiFi configuration
+const char *WIFI_SSID = "xxx";
+const char *WIFI_PASSWORD = "xxx";
 // Static IP configuration (leave empty "" for DHCP/router-assigned IP)
 // Format: "192.168.1.100" for static, or "" for DHCP
-const char *staticIP = "192.168.1.106";
-const char *gatewayIP = "192.168.1.1";    // Router gateway (e.g., 192.168.1.1)
-const char *subnetMask = "255.255.255.0"; // Subnet mask (typically 255.255.255.0)
-const char *dnsServer = "8.8.8.8";        // DNS server (e.g., 8.8.8.8 for Google DNS)
-unsigned long lastReconnectAttempt = 0;
+const char *STATIC_IP = "192.168.1.106";
+const char *GATEWAY_IP = "192.168.1.1";         // Router gateway (e.g., 192.168.1.1)
+const char *SUBNET_MASK = "255.255.255.0";      // Subnet mask (typically 255.255.255.0)
 const unsigned long RECONNECT_INTERVAL = 15000; // 15 seconds - WiFi reconnection retry interval
+// Timing for WiFi reconnection attempts
+unsigned long lastReconnectAttempt = 0;
 
-// Threshold to START recording (in grams/ml)
-const float START_THRESHOLD = 1.0;
-
-// Duration of stability to trigger STOP (in ms) (10 seconds)
+// Duration of no flow to trigger STOP (in ms) (10 seconds)
 const unsigned long STOP_TIMEOUT = 10000;
 
-// Tolerance for "no change" during stop condition (in grams)
-const float STABILITY_TOLERANCE = 1.0;
+// Maximum test duration (in ms) (5 minutes)
+const unsigned long MAX_TEST_DURATION = 300000;
 
-// Time between data points (in ms) (500ms = 2Hz)
+// Threshold to START recording (in grams)
+const float START_THRESHOLD = 2.0;
+
+// Threshold to STOP recording (in ml/s)
+// If flow stays below this value for STOP_TIMEOUT, the test ends.
+const float STOP_FLOW_THRESHOLD = 2.0;
+
+// Time between data points (in ms)
 const unsigned long SAMPLING_INTERVAL = 500;
-
-// How many sensor readings to average per sample point.
-// At default 10SPS HX711 rate, 5 readings take ~500ms.
-const int READINGS_TO_AVERAGE = 3;
 
 // Calibration factor, set your own value
 // IMPORTANT: Must be calibrated experimentally. A value of 0 will cause silent failures.
@@ -65,7 +68,7 @@ const float CALIBRATION_FACTOR = -1025.42;
 HX711 scale;
 
 // Server object
-WebServer server(80); // HTTP server on port 80
+WebServer server(80);
 
 enum TestState
 {
@@ -88,54 +91,53 @@ struct DataPoint
   // Flow rate in g/s
 };
 std::vector<DataPoint> measurements;
+SemaphoreHandle_t measurements_mutex;
 
 // Timing variables
 unsigned long lastSampleTime = 0;
 unsigned long testStartTime = 0;
 unsigned long stabilityStartTime = 0;
-float stableWeightReference = 0;
 
 // Function prototypes
-void setup();                                   // Main setup function.
-void loop();                                    // Main loop function.
-void setupWiFi();                               // Initializes WiFi connection.
-void WiFiEvent(WiFiEvent_t event);              // Handles WiFi state changes.
-void setRGBColor(int red, int green, int blue); // Sets the RGB LED color.
-void setupScale();                              // Initializes and tares the HX711 scale.
-void checkStartCondition();                     // Checks if measurement should start.
-void performMeasurement();                      // Reads scale, logs data, and checks stop.
-void checkStopCondition(float currentWeight);   // Checks if measurement should stop.
-void finalizeTest();                            // Completes and trims measurement data.
-void resetTest();                               // Clears data and tares scale.
-void handleReset();                             // Handles HTTP reset request.
-void setupWebServer();                          // Initializes the HTTP server.
-void handleRoot();                              // Serves the main control page.
-void handleResultsCSV();                        // Serves data as CSV.
-void handleNotFound();                          // Handles 404 errors.
-String stateToString(TestState state);          // Converts state enum to string.
-void handleResultsHTML();                       // Serves results with chart/summary.
+void setup();
+void loop();
+void setupWiFi();
+void WiFiEvent(WiFiEvent_t event);
+void setRGBColor(int red, int green, int blue);
+void setupScale();
+void resetTest();
+void handleReset();
+void setupWebServer();
+void handleRoot();
+void handleResultsCSV();
+void handleNotFound();
+String stateToString(TestState state);
+void handleResultsHTML();
+void taskMeasure(void *pvParameters);
+void processWeightLogic(float currentWeight);
 
 /**
  * @brief Main setup function.
- * Initializes serial, scale, LEDs, WiFi, and web server.
- * Pre-allocates vector memory for measurements to reduce fragmentation.
  */
 void setup()
 {
   Serial.begin(115200);
   Serial.println("\n=== ESP32Flow Starting ===");
   setupScale();
+  measurements_mutex = xSemaphoreCreateMutex();
 
-  ledcAttach(redPin, freq, resolution);
-  ledcAttach(greenPin, freq, resolution);
-  ledcAttach(bluePin, freq, resolution);
+  ledcAttach(RED_PIN, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(GREEN_PIN, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(BLUE_PIN, PWM_FREQ, PWM_RESOLUTION);
 
-  // Pre-allocate memory for measurements vector
-  // Estimate: ~10 seconds at 2Hz = 20 points, budget for 500 measurements
-  measurements.reserve(500);
+  // Reserve memory for 3 minutes of data at the given sampling interval.
+  measurements.reserve((3 * 60 * 1000) / SAMPLING_INTERVAL);
 
   setupWiFi();
   setupWebServer();
+
+  // Create pinned FreeRTOS task
+  xTaskCreatePinnedToCore(taskMeasure, "measure", 4096, NULL, 2, NULL, 1);
 }
 
 /**
@@ -143,12 +145,11 @@ void setup()
  */
 void loop()
 {
-  server.handleClient();
-
+  updateLED(currentState);
   switch (currentState)
   {
   case OFFLINE:
-    setRGBColor(255, 0, 0); // Red
+  case ERROR:
     // Check if it's time to try reconnecting
     if (millis() - lastReconnectAttempt >= RECONNECT_INTERVAL)
     {
@@ -157,29 +158,44 @@ void loop()
       lastReconnectAttempt = millis();
     }
     break;
-
-  case ERROR:
-    setRGBColor(255, 0, 255); // purple.
-    break;
-
-  case IDLE:
-    setRGBColor(0, 255, 0); // green.
-    checkStartCondition();
-    break;
-
-  case MEASURING:
-    setRGBColor(255, 165, 0); // orange.
-    if (millis() - lastSampleTime >= SAMPLING_INTERVAL)
-    {
-      performMeasurement();
-      lastSampleTime = millis();
-    }
-    break;
-
-  case COMPLETED:
-    setRGBColor(0, 0, 255); // blue.
+  default:
+    server.handleClient();
     break;
   }
+}
+
+/**
+ * @brief Set the LED color based on state.
+ */
+void updateLED(TestState state)
+{
+  static TestState lastState = (TestState)-1;
+  if (state == lastState)
+  {
+    return; // No change
+  }
+  switch (state)
+  {
+  case OFFLINE:
+    setRGBColor(255, 0, 0); // Red
+    break;
+  case IDLE:
+    setRGBColor(0, 255, 0); // Green
+    break;
+  case MEASURING:
+    setRGBColor(255, 165, 0); // Orange
+    break;
+  case COMPLETED:
+    setRGBColor(0, 0, 255); // Blue
+    break;
+  case ERROR:
+    setRGBColor(255, 0, 255); // Magenta
+    break;
+  default:
+    setRGBColor(0, 0, 0); // Off
+    break;
+  }
+  lastState = state;
 }
 
 /**
@@ -187,30 +203,26 @@ void loop()
  */
 void setupWiFi()
 {
-  setRGBColor(255, 0, 0); // Red
+  updateLED(OFFLINE);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.onEvent(WiFiEvent);
 
   // Apply static IP if configured, otherwise use DHCP
-  if (strlen(staticIP) > 0)
+  if (strlen(STATIC_IP) > 0)
   {
     Serial.print("Configuring static IP: ");
-    Serial.println(staticIP);
+    Serial.println(STATIC_IP);
     IPAddress ip;
+    ip.fromString(STATIC_IP);
     IPAddress gateway;
+    gateway.fromString(GATEWAY_IP);
     IPAddress subnet;
-    IPAddress dns;
-
-    ip.fromString(staticIP);
-    gateway.fromString(gatewayIP);
-    subnet.fromString(subnetMask);
-    dns.fromString(dnsServer);
-
-    WiFi.config(ip, gateway, subnet, dns);
+    subnet.fromString(SUBNET_MASK);
+    WiFi.config(ip, gateway, subnet);
   }
 
-  WiFi.begin(ssid, password);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
 /**
@@ -220,10 +232,6 @@ void WiFiEvent(WiFiEvent_t event)
 {
   switch (event)
   {
-  case ARDUINO_EVENT_WIFI_STA_START:
-    Serial.println("WiFi starting... Attempting connection.");
-    break;
-
   case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
     Serial.println("Wi-Fi Disconnected....");
     lastReconnectAttempt = millis();
@@ -236,21 +244,10 @@ void WiFiEvent(WiFiEvent_t event)
     currentState = OFFLINE;
     break;
 
-  case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-    Serial.println("Wi-Fi Connected! Waiting for IP...");
-    break;
-
   case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-    Serial.print("IP Address: ");
+    Serial.print("Wi-Fi Connected, IP Address: ");
     Serial.println(WiFi.localIP());
-    Serial.print("RRSI: ");
-    Serial.println(WiFi.RSSI());
-    // Force a reset when coming back online.
     currentState = COMPLETED;
-    break;
-
-  case ARDUINO_EVENT_WIFI_STA_STOP:
-    currentState = OFFLINE;
     break;
 
   default:
@@ -263,9 +260,9 @@ void WiFiEvent(WiFiEvent_t event)
  */
 void setRGBColor(int red, int green, int blue)
 {
-  ledcWrite(redPin, red);
-  ledcWrite(greenPin, green);
-  ledcWrite(bluePin, blue);
+  ledcWrite(RED_PIN, red);
+  ledcWrite(GREEN_PIN, green);
+  ledcWrite(BLUE_PIN, blue);
 }
 
 /**
@@ -289,112 +286,21 @@ void setupScale()
 }
 
 /**
- * @brief Checks if measurement should start.
- */
-void checkStartCondition()
-{
-  float currentWeight = scale.get_units(1);
-
-  if (currentWeight >= START_THRESHOLD)
-  {
-    Serial.println("Recording started at " + String(currentWeight) + "g");
-
-    currentState = MEASURING;
-    testStartTime = millis();
-    lastSampleTime = millis() - SAMPLING_INTERVAL; // Force immediate first sample
-    stabilityStartTime = millis();
-    stableWeightReference = currentWeight;
-  }
-}
-
-/**
- * @brief Reads scale, logs data, and checks stop.
- */
-void performMeasurement()
-{
-  float currentWeight = scale.get_units(READINGS_TO_AVERAGE);
-  unsigned long currentTime = millis() - testStartTime;
-
-  float flowRate = 0;
-  float deltaW = 0;
-  float deltaT = 0;
-
-  if (measurements.size() > 0)
-  {
-    deltaW = currentWeight - measurements.back().weight;
-    deltaT = currentTime - measurements.back().timeOffset;
-
-    // Safety check: prevent divide-by-zero and ensure valid flow rate calculation
-    if (deltaT > 0)
-    {
-      flowRate = (deltaW * 1000.0f) / deltaT;
-    }
-  }
-  measurements.push_back({currentTime, currentWeight, flowRate});
-  checkStopCondition(currentWeight);
-}
-
-/**
- * @brief Checks if measurement should stop.
- */
-void checkStopCondition(float currentWeight)
-{
-  float change = fabs(currentWeight - stableWeightReference);
-
-  if (change > STABILITY_TOLERANCE)
-  {
-    stabilityStartTime = millis();
-    stableWeightReference = currentWeight;
-  }
-  else
-  {
-    if (millis() - stabilityStartTime >= STOP_TIMEOUT)
-    {
-      Serial.println("Recording stopped");
-      finalizeTest();
-    }
-  }
-}
-
-/**
- * @brief Completes and trims measurement data.
- * Removes data points recorded after stability was detected.
- */
-void finalizeTest()
-{
-  currentState = COMPLETED;
-  unsigned long actualEndTime = stabilityStartTime - testStartTime;
-
-  // Find the first data point AFTER actualEndTime and trim from there
-  size_t trimIndex = measurements.size(); // Default: keep all
-  for (size_t i = 0; i < measurements.size(); i++)
-  {
-    if (measurements[i].timeOffset > actualEndTime)
-    {
-      trimIndex = i;
-      break; // Found first point beyond end time
-    }
-  }
-
-  // Trim to actualEndTime (keep data up to and including the point at or before actualEndTime)
-  if (trimIndex < measurements.size())
-  {
-    measurements.resize(trimIndex);
-  }
-}
-
-/**
  * @brief Clears data and tares scale.
  */
 void resetTest()
 {
-  measurements.clear();
-  measurements.shrink_to_fit();
+  if (xSemaphoreTake(measurements_mutex, portMAX_DELAY) == pdTRUE)
+  {
+    measurements.clear();
+    measurements.shrink_to_fit();
 
-  Serial.println("Taring...");
-  scale.tare();
-  currentState = IDLE;
-  Serial.println("Ready for new test.");
+    Serial.println("Taring...");
+    scale.tare();
+    currentState = IDLE;
+    Serial.println("Ready for new test.");
+    xSemaphoreGive(measurements_mutex);
+  }
 }
 
 /**
@@ -409,6 +315,174 @@ void setupWebServer()
   server.on("/results.csv", HTTP_GET, handleResultsCSV);
   server.onNotFound(handleNotFound);
   server.begin();
+}
+
+/**
+ * @brief FreeRTOS task - Continuous Background Sampling
+ * Reads raw data constantly, averages it, and triggers logic every 250ms.
+ */
+void taskMeasure(void *pvParameters)
+{
+  (void)pvParameters;
+  const TickType_t delayTicks = pdMS_TO_TICKS(25);
+
+  long readingAccumulator = 0;
+  int readingCount = 0;
+  unsigned long lastProcessTime = millis();
+
+  for (;;)
+  {
+    // Accumulate Readings
+    if (xSemaphoreTake(measurements_mutex, portMAX_DELAY) == pdTRUE)
+    {
+      if (scale.is_ready())
+      {
+        readingAccumulator += scale.read();
+        readingCount++;
+      }
+      xSemaphoreGive(measurements_mutex);
+    }
+
+    // Process every SAMPLING_INTERVAL
+    if (millis() - lastProcessTime >= SAMPLING_INTERVAL)
+    {
+      float currentWeight = 0;
+
+      if (xSemaphoreTake(measurements_mutex, portMAX_DELAY) == pdTRUE)
+      {
+        // Calculate Average
+        if (readingCount > 0)
+        {
+          long rawAverage = readingAccumulator / readingCount;
+          currentWeight = (rawAverage - scale.get_offset()) / scale.get_scale();
+        }
+        else if (!measurements.empty())
+        {
+          currentWeight = measurements.back().weight;
+        }
+
+        // Pass averaged weight to the centralized logic
+        processWeightLogic(currentWeight);
+
+        // Reset accumulators
+        readingAccumulator = 0;
+        readingCount = 0;
+        lastProcessTime = millis();
+
+        xSemaphoreGive(measurements_mutex);
+      }
+    }
+
+    vTaskDelay(delayTicks);
+  }
+}
+
+/**
+ * @brief Central Logic Handler (The State Machine)
+ * Handles the entire lifecycle: Detection -> Recording -> Stop Check -> Finalizing
+ */
+void processWeightLogic(float currentWeight)
+{
+  unsigned long currentTime = millis();
+  static int consistentWeidhtReadings = 0;
+
+  switch (currentState)
+  {
+  case IDLE:
+    if (currentWeight >= START_THRESHOLD)
+    {
+      consistentWeidhtReadings++;
+      if (consistentWeidhtReadings >= 2)
+      {
+        Serial.println("Start detected: Switch to MEASURING");
+
+        currentState = MEASURING;
+        testStartTime = millis();
+        stabilityStartTime = millis();
+
+        // Add initial point (T=0)
+        measurements.push_back({0, currentWeight, 0});
+      }
+    }
+    else
+    {
+      // Reset counter if weight drops below threshold, likely noise.
+      consistentWeidhtReadings = 0;
+    }
+    break;
+
+  case MEASURING:
+  {
+    unsigned long timeOffset = currentTime - testStartTime;
+
+    if (timeOffset > MAX_TEST_DURATION)
+    {
+      Serial.println("Max duration reached. Force stop.");
+      currentState = COMPLETED;
+      return;
+    }
+
+    // Calculate Flow Rate
+    float flowRate = 0;
+    if (!measurements.empty())
+    {
+      DataPoint lastPoint = measurements.back();
+      // Ignore negative weight changes
+      float deltaW = fmaxf(0.0f, currentWeight - lastPoint.weight);
+      float deltaT = timeOffset - lastPoint.timeOffset;
+
+      if (deltaT > 0)
+      {
+        float rawFlow = (deltaW * 1000.0f) / deltaT;
+        // Low Pass Filter (50% new, 50% old)
+        flowRate = (rawFlow * 0.5) + (lastPoint.flowRate * 0.5);
+      }
+    }
+
+    // Store Data
+    measurements.push_back({timeOffset, currentWeight, flowRate});
+
+    // Check Stop Condition based on flow rate)
+    if (flowRate > STOP_FLOW_THRESHOLD)
+    {
+      stabilityStartTime = millis();
+    }
+    else
+    {
+      // Flow is effectively zero (or very low) -> Check duration
+      if (millis() - stabilityStartTime >= STOP_TIMEOUT)
+      {
+        Serial.println("Flow stopped. Finishing test.");
+        currentState = COMPLETED;
+
+        // Remove the data points recorded during the wait period
+        unsigned long actualEndTime = stabilityStartTime - testStartTime;
+        size_t trimIndex = measurements.size();
+
+        for (size_t i = 0; i < measurements.size(); i++)
+        {
+          if (measurements[i].timeOffset > actualEndTime)
+          {
+            trimIndex = i;
+            break;
+          }
+        }
+
+        if (trimIndex < measurements.size())
+        {
+          measurements.resize(trimIndex);
+        }
+
+        Serial.print("Test Finalized. Duration: ");
+        Serial.println(actualEndTime / 1000.0);
+      }
+    }
+  }
+  break;
+
+  default:
+    break;
+  }
 }
 
 // CSV and HTTP constants
@@ -481,11 +555,12 @@ const char htmlRoot[] = R"rawliteral(
   document.getElementById('startButton').addEventListener('click', function() {
    document.getElementById('status').innerText = 'Resetting...';
    fetch('/reset')
-    .then(response => {
+    .then(async response => {
      if (response.ok) {
       document.getElementById('status').innerText = 'Success! Ready to start measuring.';
      } else {
-      document.getElementById('status').innerText = 'Error reseting.';
+      const errorText = await response.text();
+      document.getElementById('status').innerText = errorText;
      }
     })
     .catch(error => {
@@ -516,22 +591,25 @@ void handleResultsHTML()
   float totalFlowRateSum = 0.0;
   float testDuration = 0.0;
   String stateStr = stateToString(currentState);
+  std::vector<DataPoint> measurementsCopy;
 
-  if (!measurements.empty())
+  if (xSemaphoreTake(measurements_mutex, portMAX_DELAY) == pdTRUE)
   {
-    totalVoided = measurements.back().weight;
-    testDuration = measurements.back().timeOffset / 1000.0;
-    for (size_t i = 0; i < measurements.size(); i++)
+    measurementsCopy = measurements;
+    xSemaphoreGive(measurements_mutex);
+  }
+  if (!measurementsCopy.empty())
+  {
+    totalVoided = measurementsCopy.back().weight;
+    testDuration = measurementsCopy.back().timeOffset / 1000.0;
+    for (const auto &m : measurementsCopy)
     {
-      float currentFlow = measurements[i].flowRate;
-      totalFlowRateSum += currentFlow;
-      if (currentFlow > maxFlowRate)
-      {
-        maxFlowRate = currentFlow;
-      }
+      totalFlowRateSum += m.flowRate;
+      if (m.flowRate > maxFlowRate)
+        maxFlowRate = m.flowRate;
     }
   }
-  float averageFlow = (measurements.size() > 0) ? (totalFlowRateSum / measurements.size()) : 0.0;
+  float averageFlow = (measurementsCopy.size() > 0) ? (totalFlowRateSum / measurementsCopy.size()) : 0.0;
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
@@ -559,21 +637,20 @@ void handleResultsHTML()
     ['Time (s)', 'Flow Rate (ml/s)', 'Volume (ml)'],
 )rawliteral");
 
-  if (measurements.empty())
+  if (measurementsCopy.empty())
   {
     server.sendContent("[0, 0, 0]");
   }
   else
   {
-    for (size_t i = 0; i < measurements.size(); i++)
+    for (size_t i = 0; i < measurementsCopy.size(); i++)
     {
-      // Build row efficiently using formatted string
       char row[100];
       snprintf(row, sizeof(row), "[%.2f,%.2f,%.2f]%s",
-               measurements[i].timeOffset / 1000.0,
-               measurements[i].flowRate,
-               measurements[i].weight,
-               (i < measurements.size() - 1) ? "," : "");
+               measurementsCopy[i].timeOffset / 1000.0,
+               measurementsCopy[i].flowRate,
+               measurementsCopy[i].weight,
+               (i < measurementsCopy.size() - 1) ? "," : "");
       server.sendContent(row);
     }
   }
@@ -631,25 +708,24 @@ void handleResultsCSV()
   // Get timestamp from query parameter (client timezone) if provided
   String filename = "results.csv";
   if (server.hasArg("ts"))
-  {
-    String clientTimestamp = server.arg("ts");
-    filename = "uroflow_" + clientTimestamp + ".csv";
-  }
+    filename = "uroflow_" + server.arg("ts") + ".csv";
 
-  // Build Content-Disposition header with dynamic filename
-  String dispositionHeader = "attachment; filename=" + filename;
-  server.sendHeader("Content-Disposition", dispositionHeader);
+  server.sendHeader("Content-Disposition", "attachment; filename=" + filename);
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, CONTENT_TYPE_CSV, "");
   server.sendContent(CSV_HEADER);
 
-  if (!measurements.empty())
+  std::vector<DataPoint> measurementsCopy;
+  if (xSemaphoreTake(measurements_mutex, portMAX_DELAY) == pdTRUE)
   {
-    for (const auto &m : measurements)
-    {
-      String line = String(m.timeOffset) + "," + String(m.weight, 2) + "," + String(m.flowRate, 2) + "\n";
-      server.sendContent(line);
-    }
+    measurementsCopy = measurements;
+    xSemaphoreGive(measurements_mutex);
+  }
+
+  for (const auto &m : measurementsCopy)
+  {
+    String line = String(m.timeOffset) + "," + String(m.weight, 2) + "," + String(m.flowRate, 2) + "\n";
+    server.sendContent(line);
   }
   server.sendContent("");
 }
@@ -667,8 +743,13 @@ void handleNotFound()
  */
 void handleReset()
 {
+  if (currentState == MEASURING)
+  {
+    server.send(412, "text/plain", "Cannot reset during measurement.");
+    return;
+  }
   resetTest();
-  server.send(200, "text/plain", "OK. Measurement reset. Waiting for start.");
+  server.send(200, "text/plain", "Measurement reset. Waiting for start!");
 }
 
 /**
@@ -679,7 +760,7 @@ String stateToString(TestState state)
   switch (state)
   {
   case OFFLINE:
-    return "OFFLINE (WiFi Disconnected)";
+    return "OFFLINE";
   case IDLE:
     return "IDLE";
   case MEASURING:
