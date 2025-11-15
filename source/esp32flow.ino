@@ -32,6 +32,12 @@ const int bluePin = 19;
 // Wifi configuration.
 const char *ssid = "xxx";
 const char *password = "xxx";
+// Static IP configuration (leave empty "" for DHCP/router-assigned IP)
+// Format: "192.168.1.100" for static, or "" for DHCP
+const char *staticIP = "192.168.1.106";
+const char *gatewayIP = "192.168.1.1";    // Router gateway (e.g., 192.168.1.1)
+const char *subnetMask = "255.255.255.0"; // Subnet mask (typically 255.255.255.0)
+const char *dnsServer = "8.8.8.8";        // DNS server (e.g., 8.8.8.8 for Google DNS)
 unsigned long lastReconnectAttempt = 0;
 const unsigned long RECONNECT_INTERVAL = 15000; // 15 seconds - WiFi reconnection retry interval
 
@@ -55,12 +61,6 @@ const int READINGS_TO_AVERAGE = 3;
 // IMPORTANT: Must be calibrated experimentally. A value of 0 will cause silent failures.
 const float CALIBRATION_FACTOR = -1025.42;
 
-// CSV and HTTP constants
-const char CSV_HEADER[] = "Time (ms),Weight (g),FlowRate (ml/s)\n";
-const char CONTENT_TYPE_HTML[] = "text/html";
-const char CONTENT_TYPE_CSV[] = "text/csv";
-const char CONTENT_TYPE_PLAIN[] = "text/plain";
-
 // Scale object
 HX711 scale;
 
@@ -70,6 +70,7 @@ WebServer server(80); // HTTP server on port 80
 enum TestState
 {
   OFFLINE,
+  ERROR,
   IDLE,
   MEASURING,
   COMPLETED
@@ -87,7 +88,6 @@ struct DataPoint
   // Flow rate in g/s
 };
 std::vector<DataPoint> measurements;
-portMUX_TYPE measurementsMutex = portMUX_INITIALIZER_UNLOCKED;
 
 // Timing variables
 unsigned long lastSampleTime = 0;
@@ -153,9 +153,13 @@ void loop()
     if (millis() - lastReconnectAttempt >= RECONNECT_INTERVAL)
     {
       Serial.println("Offline. Attempting WiFi reconnection...");
-      WiFi.begin(ssid, password);
+      WiFi.reconnect();
       lastReconnectAttempt = millis();
     }
+    break;
+
+  case ERROR:
+    setRGBColor(255, 0, 255); // purple.
     break;
 
   case IDLE:
@@ -183,9 +187,29 @@ void loop()
  */
 void setupWiFi()
 {
+  setRGBColor(255, 0, 0); // Red
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.onEvent(WiFiEvent);
+
+  // Apply static IP if configured, otherwise use DHCP
+  if (strlen(staticIP) > 0)
+  {
+    Serial.print("Configuring static IP: ");
+    Serial.println(staticIP);
+    IPAddress ip;
+    IPAddress gateway;
+    IPAddress subnet;
+    IPAddress dns;
+
+    ip.fromString(staticIP);
+    gateway.fromString(gatewayIP);
+    subnet.fromString(subnetMask);
+    dns.fromString(dnsServer);
+
+    WiFi.config(ip, gateway, subnet, dns);
+  }
+
   WiFi.begin(ssid, password);
 }
 
@@ -198,19 +222,18 @@ void WiFiEvent(WiFiEvent_t event)
   {
   case ARDUINO_EVENT_WIFI_STA_START:
     Serial.println("WiFi starting... Attempting connection.");
-    currentState = OFFLINE;
-    setRGBColor(255, 0, 0); // red.
     break;
 
   case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
     Serial.println("Wi-Fi Disconnected....");
+    lastReconnectAttempt = millis();
     if (currentState == MEASURING)
     {
       Serial.println("Aborting test due to disconnect.");
+      currentState = ERROR;
+      break;
     }
     currentState = OFFLINE;
-    setRGBColor(255, 0, 0); // red.
-    lastReconnectAttempt = millis();
     break;
 
   case ARDUINO_EVENT_WIFI_STA_CONNECTED:
@@ -220,19 +243,10 @@ void WiFiEvent(WiFiEvent_t event)
   case ARDUINO_EVENT_WIFI_STA_GOT_IP:
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
-
-    portENTER_CRITICAL(&measurementsMutex);
-    if (measurements.size() > 0)
-
-    {
-      // Force a reset when coming back online.
-      currentState = COMPLETED;
-    }
-    else
-    {
-      currentState = IDLE;
-    }
-    portEXIT_CRITICAL(&measurementsMutex);
+    Serial.print("RRSI: ");
+    Serial.println(WiFi.RSSI());
+    // Force a reset when coming back online.
+    currentState = COMPLETED;
     break;
 
   case ARDUINO_EVENT_WIFI_STA_STOP:
@@ -305,7 +319,6 @@ void performMeasurement()
   float deltaW = 0;
   float deltaT = 0;
 
-  portENTER_CRITICAL(&measurementsMutex);
   if (measurements.size() > 0)
   {
     deltaW = currentWeight - measurements.back().weight;
@@ -318,7 +331,6 @@ void performMeasurement()
     }
   }
   measurements.push_back({currentTime, currentWeight, flowRate});
-  portEXIT_CRITICAL(&measurementsMutex);
   checkStopCondition(currentWeight);
 }
 
@@ -353,8 +365,6 @@ void finalizeTest()
   currentState = COMPLETED;
   unsigned long actualEndTime = stabilityStartTime - testStartTime;
 
-  portENTER_CRITICAL(&measurementsMutex);
-
   // Find the first data point AFTER actualEndTime and trim from there
   size_t trimIndex = measurements.size(); // Default: keep all
   for (size_t i = 0; i < measurements.size(); i++)
@@ -371,8 +381,6 @@ void finalizeTest()
   {
     measurements.resize(trimIndex);
   }
-
-  portEXIT_CRITICAL(&measurementsMutex);
 }
 
 /**
@@ -380,20 +388,12 @@ void finalizeTest()
  */
 void resetTest()
 {
-  portENTER_CRITICAL(&measurementsMutex);
   measurements.clear();
   measurements.shrink_to_fit();
-  portEXIT_CRITICAL(&measurementsMutex);
 
   Serial.println("Taring...");
   scale.tare();
-
-  if (currentState != OFFLINE)
-
-  {
-    currentState = IDLE;
-  }
-
+  currentState = IDLE;
   Serial.println("Ready for new test.");
 }
 
@@ -411,12 +411,14 @@ void setupWebServer()
   server.begin();
 }
 
-/**
- * @brief Serves the main control page.
- */
-void handleRoot()
-{
-  String html = R"rawliteral(
+// CSV and HTTP constants
+const char CSV_HEADER[] = "Time (ms),Weight (g),FlowRate (ml/s)\n";
+const char CONTENT_TYPE_HTML[] = "text/html";
+const char CONTENT_TYPE_CSV[] = "text/csv";
+const char CONTENT_TYPE_PLAIN[] = "text/plain";
+
+// HTML constant for main control page
+const char htmlRoot[] = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -495,7 +497,12 @@ void handleRoot()
 </html>
 )rawliteral";
 
-  server.send(200, CONTENT_TYPE_HTML, html);
+/**
+ * @brief Serves the main control page.
+ */
+void handleRoot()
+{
+  server.send(200, CONTENT_TYPE_HTML, htmlRoot);
 }
 
 /**
@@ -503,10 +510,6 @@ void handleRoot()
  */
 void handleResultsHTML()
 {
-  std::vector<DataPoint> measurements_copy;
-  portENTER_CRITICAL(&measurementsMutex);
-  measurements_copy = measurements;
-  portEXIT_CRITICAL(&measurementsMutex);
 
   float totalVoided = 0.0;
   float maxFlowRate = 0.0;
@@ -514,13 +517,13 @@ void handleResultsHTML()
   float testDuration = 0.0;
   String stateStr = stateToString(currentState);
 
-  if (!measurements_copy.empty())
+  if (!measurements.empty())
   {
-    totalVoided = measurements_copy.back().weight;
-    testDuration = measurements_copy.back().timeOffset / 1000.0;
-    for (size_t i = 0; i < measurements_copy.size(); i++)
+    totalVoided = measurements.back().weight;
+    testDuration = measurements.back().timeOffset / 1000.0;
+    for (size_t i = 0; i < measurements.size(); i++)
     {
-      float currentFlow = measurements_copy[i].flowRate;
+      float currentFlow = measurements[i].flowRate;
       totalFlowRateSum += currentFlow;
       if (currentFlow > maxFlowRate)
       {
@@ -528,7 +531,7 @@ void handleResultsHTML()
       }
     }
   }
-  float averageFlow = (measurements_copy.size() > 0) ? (totalFlowRateSum / measurements_copy.size()) : 0.0;
+  float averageFlow = (measurements.size() > 0) ? (totalFlowRateSum / measurements.size()) : 0.0;
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
@@ -547,9 +550,6 @@ void handleResultsHTML()
  .summary-table th { background-color: #ecf0f1; font-weight: bold; width: 40%; }
  .summary-table tr:nth-child(even) { background-color: #f9f9f9; }
 </style>
-)rawliteral");
-
-  server.sendContent(R"rawliteral(
 <script type="text/javascript" src="https://www.gstatic.com/charts/loader.js"></script>
 <script type="text/javascript">
  google.charts.load('current', {'packages':['corechart']});
@@ -559,21 +559,21 @@ void handleResultsHTML()
     ['Time (s)', 'Flow Rate (ml/s)', 'Volume (ml)'],
 )rawliteral");
 
-  if (measurements_copy.empty())
+  if (measurements.empty())
   {
     server.sendContent("[0, 0, 0]");
   }
   else
   {
-    for (size_t i = 0; i < measurements_copy.size(); i++)
+    for (size_t i = 0; i < measurements.size(); i++)
     {
       // Build row efficiently using formatted string
       char row[100];
       snprintf(row, sizeof(row), "[%.2f,%.2f,%.2f]%s",
-               measurements_copy[i].timeOffset / 1000.0,
-               measurements_copy[i].flowRate,
-               measurements_copy[i].weight,
-               (i < measurements_copy.size() - 1) ? "," : "");
+               measurements[i].timeOffset / 1000.0,
+               measurements[i].flowRate,
+               measurements[i].weight,
+               (i < measurements.size() - 1) ? "," : "");
       server.sendContent(row);
     }
   }
@@ -611,7 +611,6 @@ void handleResultsHTML()
   server.sendContent("<th>Average Flow:</th><td>" + String(averageFlow, 2) + " ml/s</td></tr>");
   server.sendContent("</table>");
   server.sendContent("<hr>");
-
   server.sendContent(R"rawliteral(
 <div id="curve_chart" style="width: 100%; height: 600px"></div>
 <hr>
@@ -629,11 +628,6 @@ void handleResultsHTML()
  */
 void handleResultsCSV()
 {
-  std::vector<DataPoint> measurements_copy;
-  portENTER_CRITICAL(&measurementsMutex);
-  measurements_copy = measurements;
-  portEXIT_CRITICAL(&measurementsMutex);
-
   // Get timestamp from query parameter (client timezone) if provided
   String filename = "results.csv";
   if (server.hasArg("ts"))
@@ -649,9 +643,9 @@ void handleResultsCSV()
   server.send(200, CONTENT_TYPE_CSV, "");
   server.sendContent(CSV_HEADER);
 
-  if (!measurements_copy.empty())
+  if (!measurements.empty())
   {
-    for (const auto &m : measurements_copy)
+    for (const auto &m : measurements)
     {
       String line = String(m.timeOffset) + "," + String(m.weight, 2) + "," + String(m.flowRate, 2) + "\n";
       server.sendContent(line);

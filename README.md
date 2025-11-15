@@ -70,6 +70,10 @@ Before uploading, modify the following constants in the code (`#include <Arduino
 | :--- | :--- | :--- |
 | `ssid` | Your Wi-Fi network name. | `"xxx"` |
 | `password` | Your Wi-Fi network password. | `"xxx"` |
+| `staticIP` | Static IP address. Leave empty `""` for DHCP (router-assigned), or specify an IP like `"192.168.1.100"`. | `""` (DHCP) |
+| `gatewayIP` | Router gateway IP (used only if `staticIP` is configured). | `"192.168.1.1"` |
+| `subnetMask` | Network subnet mask (used only if `staticIP` is configured). | `"255.255.255.0"` |
+| `dnsServer` | DNS server (used only if `staticIP` is configured). | `"8.8.8.8"` |
 | `CALIBRATION_FACTOR` | **Crucial:** Your load cell's specific calibration value (units per gram). **Must be determined experimentally.** | `-1025.42` |
 | `START_THRESHOLD` | Minimum weight (in grams) to begin recording. | `1.0` |
 | `STOP_TIMEOUT` | Duration (in ms) of stability before stopping the recording. | `10000` (10 seconds) |
@@ -110,6 +114,7 @@ The RGB LED provides a quick visual indication of the system's status:
 | `IDLE` | **Green** | Ready for measurement. Awaiting weight change. |
 | `MEASURING` | **Orange** | Actively recording weight and calculating flow rate. |
 | `COMPLETED` | **Blue** | Measurement is complete and results are available. |
+| `ERROR` | **Magenta** | Measurement was interrupted by a Wi-Fi disconnect. |
 
 ---
 
